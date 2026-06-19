@@ -187,17 +187,19 @@ int main(void) {
     socket_q = dispatch_queue_create(
         "com.aerospace-swipe-intercept.socket", DISPATCH_QUEUE_SERIAL);
 
-    // Prompt for Accessibility permission if not already granted
-    const void *keys[] = { kAXTrustedCheckOptionPrompt };
-    const void *vals[] = { kCFBooleanTrue };
-    CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    bool ok = AXIsProcessTrustedWithOptions(opts);
-    CFRelease(opts);
-    if (!ok) {
+    // Prompt for Accessibility permission if not already granted, then poll until
+    // it is — never exit, so KeepAlive doesn't restart us in an infinite prompt loop.
+    if (!AXIsProcessTrusted()) {
+        const void *keys[] = { kAXTrustedCheckOptionPrompt };
+        const void *vals[] = { kCFBooleanTrue };
+        CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        AXIsProcessTrustedWithOptions(opts); // show the dialog once
+        CFRelease(opts);
         fprintf(stderr, "aerospace-swipe-intercept: "
-                "Grant Accessibility permission, then re-run.\n");
-        return 1;
+                "waiting for Accessibility permission...\n");
+        while (!AXIsProcessTrusted()) sleep(2);
+        fprintf(stderr, "aerospace-swipe-intercept: Accessibility granted\n");
     }
 
     tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,

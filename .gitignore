@@ -1,3 +1,6 @@
 aerospace-swipe-intercept
+AerospaceSwipeIntercept.app/
 *.o
 *.dSYM/
+*.dmg
+*.zip
