@@ -1,68 +1,68 @@
 # aerospace-swipe-intercept
 
-Turns 3-finger horizontal trackpad swipes into [AeroSpace](https://github.com/nikitabobko/AeroSpace) workspace switches — with no System Settings changes and no native full-screen animation.
+A small macOS daemon that maps 3-finger horizontal trackpad swipes to [AeroSpace](https://github.com/nikitabobko/AeroSpace) workspace switches.
 
-## How it works
+No System Settings changes. No native full-screen animation. No fragile threshold tuning.
 
-An active `CGEventTap` intercepts the private dock-swipe event (`kCGSEventDockControl`, HID type 23) that macOS generates when you 3-finger swipe. The event is suppressed before the Dock sees it, and an AeroSpace workspace command is sent over its Unix socket instead.
+## Why not aerospace-swipe?
 
-This is different from [aerospace-swipe](https://github.com/acsandmann/aerospace-swipe), which taps in listen-only mode and can't suppress the native gesture (causing dual-fire without a System Settings change). This daemon lets macOS do the gesture recognition and only redirects the result.
+[aerospace-swipe](https://github.com/acsandmann/aerospace-swipe) taps gesture events in listen-only mode and reconstructs swipes with a hand-tuned state machine. Because it can't suppress the native event, a 3-finger swipe fires both the native macOS space switch *and* the AeroSpace switch — you have to rebind the native gesture to 4-finger in System Settings to avoid it.
+
+This daemon works differently: it intercepts the internal dock-swipe event that macOS generates *after* recognizing the gesture, suppresses it before the Dock sees it, and sends the AeroSpace command instead. macOS does the gesture recognition; this only redirects the result.
 
 ```
-3-finger swipe → macOS HID → dock-swipe event
-                                    │
-                           [aerospace-swipe-intercept]
-                                    │
-                    ┌───────────────┴───────────────┐
-                return NULL (suppress)          send to AeroSpace socket
-                Dock never switches             workspace next / prev
+3-finger swipe
+      │
+      ▼
+ macOS HID → dock-swipe event (private CGS type 30)
+                    │
+      [aerospace-swipe-intercept] ← active CGEventTap
+                    │
+        ┌───────────┴────────────┐
+    return NULL              AeroSpace socket
+  (Dock never fires)       workspace next/prev
 ```
-
-Vertical swipes (Mission Control, App Exposé) are left untouched.
-
-## Requirements
-
-- macOS with AeroSpace installed and running
-- AeroSpace 0.20.x (socket protocol is version-coupled)
-- Xcode Command Line Tools (`xcode-select --install`)
 
 ## Install
 
 ```sh
+git clone https://github.com/samcolmanetti/aerospace-swipe-intercept
+cd aerospace-swipe-intercept
 make
 make install
 ```
 
-`make install` builds the binary, signs it, installs it to `~/.local/bin`, and registers a `RunAtLoad`/`KeepAlive` LaunchAgent. Swipes are active on next login (or immediately after install).
+Requires Xcode Command Line Tools (`xcode-select --install`).
 
-### Unload the incumbent tool first
+`make install` builds the binary, signs it, installs it to `~/.local/bin`, and registers a `RunAtLoad`/`KeepAlive` LaunchAgent. It starts immediately and runs on every login.
 
-If `AerospaceSwipe.app` (aerospace-swipe) is running, both daemons will react to every swipe — causing double-switches. Quit it and remove its LaunchAgent before installing this one:
+### Uninstall aerospace-swipe first
+
+If `aerospace-swipe` (AerospaceSwipe.app) is already running, both daemons will react to every swipe and double-switch. Remove it first:
 
 ```sh
-# Quit AerospaceSwipe.app from the menu bar or:
 osascript -e 'quit app "AerospaceSwipe"'
-
-# Remove its LaunchAgent (label varies — check ~/Library/LaunchAgents/)
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.acsandmann.AerospaceSwipe.plist 2>/dev/null || true
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.acsandmann.swipe.plist 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/com.acsandmann.swipe.plist
 ```
 
 ## Permissions
 
-- **Accessibility** — required to create an active event tap. Prompted automatically on first run.
-- **Input Monitoring** — may be prompted by macOS; grant it if asked.
+Grant **Accessibility** access when prompted on first run. macOS may also prompt for **Input Monitoring** — grant that too if asked.
 
 No SIP disabling required.
 
-## Behavior and limitations
+## Behavior
 
-**No System Settings change needed.** The daemon suppresses the native dock-swipe event upstream, so the System Settings > Trackpad gesture toggle stays on and doesn't conflict.
+| | |
+|---|---|
+| Swipe right | `workspace --wrap-around next` |
+| Swipe left | `workspace --wrap-around prev` |
+| Swipe up/down | Unchanged (Mission Control, App Exposé) |
+| AeroSpace not running | Swipe is a no-op (event suppressed, nothing sent) |
+| Tap disabled | Watchdog re-enables it; notifies you after ~3s of downtime |
 
-**Accepted dead-air.** When AeroSpace is not running or the tap is disabled, horizontal 3-finger swipes do nothing (the event is suppressed but not redirected). The watchdog (see below) notifies you if the tap goes down.
-
-**Wrap-around.** Swiping past the last/first workspace wraps around. This is delegated to AeroSpace's `--wrap-around` flag.
-
-**Watchdog.** If the tap stays disabled for ~3 seconds (e.g. after revoking Accessibility permission), a macOS notification is shown: "Gesture tap disabled — check Accessibility permission". After sleep/wake, the tap re-enables automatically without manual restart.
+The daemon connects to AeroSpace's Unix socket directly (`/tmp/bobko.aerospace-$USER.sock`) rather than shelling out to the CLI, so it's not affected by CLI behavior changes across AeroSpace versions.
 
 ## Uninstall
 
@@ -72,4 +72,4 @@ make uninstall
 
 ## Credits
 
-Interception core (tap setup, field indices, phase handling, debounce) adapted from [joshuarli/iss](https://github.com/joshuarli/iss) (BSD Zero Clause License).
+Interception core adapted from [joshuarli/iss](https://github.com/joshuarli/iss) — the tap placement, private CGEvent field indices, phase handling, and debounce logic come from there. Licensed under [0BSD](LICENSE).
