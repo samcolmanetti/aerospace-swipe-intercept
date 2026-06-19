@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      - name: Update bundle version in Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ env.VERSION }}" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ env.VERSION }}" Info.plist
+
+      - name: Build and bundle
+        run: make bundle CERT=-
+
+      - name: Strip quarantine
+        run: xattr -cr AerospaceSwipeIntercept.app
+
+      - name: Create ZIP
+        run: |
+          zip -r "AerospaceSwipeIntercept-${{ github.ref_name }}.zip" AerospaceSwipeIntercept.app
+          echo "ZIP_SHA256=$(shasum -a 256 "AerospaceSwipeIntercept-${{ github.ref_name }}.zip" | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Create DMG
+        run: |
+          mkdir dmg-staging
+          cp -r AerospaceSwipeIntercept.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create \
+            -volname "AerospaceSwipeIntercept ${{ github.ref_name }}" \
+            -srcfolder dmg-staging \
+            -ov -format UDZO \
+            "AerospaceSwipeIntercept-${{ github.ref_name }}.dmg"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "AerospaceSwipeIntercept ${{ github.ref_name }}" \
+            --notes "$(git tag -l --format='%(contents)' ${{ github.ref_name }})" \
+            "AerospaceSwipeIntercept-${{ github.ref_name }}.zip" \
+            "AerospaceSwipeIntercept-${{ github.ref_name }}.dmg"
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/samcolmanetti/homebrew-tap.git" tap
+          cd tap
+          sed -i '' \
+            -e "s|version \".*\"|version \"${{ env.VERSION }}\"|" \
+            -e "s|sha256 \".*\"|sha256 \"${{ env.ZIP_SHA256 }}\"|" \
+            Casks/aerospace-swipe-intercept.rb
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add Casks/aerospace-swipe-intercept.rb
+          git commit -m "aerospace-swipe-intercept ${{ github.ref_name }}"
+          git push
