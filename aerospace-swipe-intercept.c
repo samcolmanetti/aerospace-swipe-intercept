@@ -24,7 +24,6 @@
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +56,6 @@ static bool          swipeFired;
 static struct timespec swipeStartTime;
 
 static dispatch_queue_t  socket_q;
-static _Atomic bool      send_in_flight; // drop stale switches instead of queuing them
 static char              aerospace_sock[256]; // /tmp/bobko.aerospace-$USER.sock
 
 // Watchdog
@@ -105,14 +103,9 @@ static void send_aerospace(bool right) {
 
 // Called from the tap callback thread. Dispatches the socket write asynchronously
 // so that socket I/O can never block event delivery and trigger DisabledByTimeout.
+// The serial queue serializes concurrent writes without needing an in-flight guard.
 static void perform_switch(bool right) {
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&send_in_flight, &expected, true))
-        return; // previous send still running; drop rather than queue a stale switch
-    dispatch_async(socket_q, ^{
-        send_aerospace(right);
-        atomic_store(&send_in_flight, false);
-    });
+    dispatch_async(socket_q, ^{ send_aerospace(right); });
 }
 
 // --- Watchdog notification ---------------------------------------------------
@@ -193,7 +186,6 @@ int main(void) {
 
     socket_q = dispatch_queue_create(
         "com.aerospace-swipe-intercept.socket", DISPATCH_QUEUE_SERIAL);
-    atomic_init(&send_in_flight, false);
 
     // Prompt for Accessibility permission if not already granted
     const void *keys[] = { kAXTrustedCheckOptionPrompt };
