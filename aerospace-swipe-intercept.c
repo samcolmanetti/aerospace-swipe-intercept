@@ -22,13 +22,16 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -62,12 +65,26 @@ static char              aerospace_sock[256]; // /tmp/bobko.aerospace-$USER.sock
 static int  watchdog_disabled_ticks;
 static bool watchdog_notified;
 
+// --- Logging -----------------------------------------------------------------
+// Two levels: always-on (lifecycle + errors) and debug (verbose per-event trace).
+// Debug is off by default and toggled at runtime via SIGUSR1
+// (`killall -USR1 aerospace-swipe-intercept`). stderr is redirected by the
+// LaunchAgent plist to ~/Library/Logs/aerospace-swipe-intercept.log (no sudo).
+
+static volatile sig_atomic_t debug_enabled = 0; // verbose logging, off by default
+static volatile sig_atomic_t debug_toggled = 0; // set by SIGUSR1 handler, drained in run loop
+
+#define log_always(...) fprintf(stderr, "aerospace-swipe-intercept: " __VA_ARGS__)
+#define log_debug(...) \
+    do { if (debug_enabled) fprintf(stderr, "aerospace-swipe-intercept: " __VA_ARGS__); } while (0)
+
 // --- AeroSpace socket client -------------------------------------------------
 
 static void send_aerospace(bool right) {
+    log_debug("send_aerospace(%s)\n", right ? "next" : "prev");
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "aerospace-swipe-intercept: socket(): %s\n", strerror(errno));
+        log_always("socket(): %s\n", strerror(errno));
         return;
     }
 
@@ -82,12 +99,11 @@ static void send_aerospace(bool right) {
     strncpy(addr.sun_path, aerospace_sock, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        // AeroSpace not running — accepted dead-air per design
-        fprintf(stderr, "aerospace-swipe-intercept: connect(%s): %s\n",
-                aerospace_sock, strerror(errno));
+        log_always("connect(%s): %s\n", aerospace_sock, strerror(errno));
         close(fd);
         return;
     }
+    log_debug("connected to %s\n", aerospace_sock);
 
     // AeroSpace 0.20.x socket protocol (version-coupled; stdin key is required)
     char buf[256];
@@ -96,7 +112,9 @@ static void send_aerospace(bool right) {
         "\"stdin\":\"\",\"windowId\":null,\"workspace\":null}",
         right ? "next" : "prev");
     if (write(fd, buf, (size_t)len) < 0)
-        fprintf(stderr, "aerospace-swipe-intercept: write(): %s\n", strerror(errno));
+        log_always("write(): %s\n", strerror(errno));
+    else
+        log_debug("sent: %s\n", buf);
     // Reply carries serverVersionAndHash; ignored — we don't validate version here
     close(fd);
 }
@@ -105,6 +123,7 @@ static void send_aerospace(bool right) {
 // so that socket I/O can never block event delivery and trigger DisabledByTimeout.
 // The serial queue serializes concurrent writes without needing an in-flight guard.
 static void perform_switch(bool right) {
+    log_debug("perform_switch(%s) — dispatching\n", right ? "next" : "prev");
     dispatch_async(socket_q, ^{ send_aerospace(right); });
 }
 
@@ -123,43 +142,65 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
 
     // Re-enable after system-imposed disablement; reset any in-flight swipe state
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        log_always("tap disabled by %s — re-enabling\n",
+                   type == kCGEventTapDisabledByTimeout ? "timeout" : "user input");
         swipeTracking = swipeFired = false;
         CGEventTapEnable(tap, true);
         return ev;
     }
 
     int et = (int)CGEventGetIntegerValueField(ev, kCGSEventTypeField);
+    int hidType = (int)CGEventGetIntegerValueField(ev, kCGEventGestureHIDType);
+    int motion  = (int)CGEventGetIntegerValueField(ev, kCGEventGestureSwipeMotion);
+
+    log_debug("event type=%d cgtype=%d hidType=%d motion=%d\n",
+              (int)type, et, hidType, motion);
 
     // Only intercept horizontal dock-swipe events (not Mission Control, App Exposé, etc.)
     if (et == kCGSEventDockControl
-        && (int)CGEventGetIntegerValueField(ev, kCGEventGestureHIDType) == kIOHIDEventTypeDockSwipe
-        && (int)CGEventGetIntegerValueField(ev, kCGEventGestureSwipeMotion) == kCGGestureMotionHorizontal) {
+        && hidType == kIOHIDEventTypeDockSwipe
+        && motion == kCGGestureMotionHorizontal) {
 
         int phase = (int)CGEventGetIntegerValueField(ev, kCGEventGesturePhase);
+        double progress = CGEventGetDoubleValueField(ev, kCGEventGestureSwipeProgress);
+        double velocity = CGEventGetDoubleValueField(ev, kCGEventGestureSwipeVelocityX);
+        log_debug("dock-swipe phase=%d progress=%.3f velocity=%.3f tracking=%d fired=%d\n",
+                  phase, progress, velocity, swipeTracking, swipeFired);
 
         if (phase == kGestureBegan) {
             swipeTracking = true;
             swipeFired    = false;
             clock_gettime(CLOCK_MONOTONIC, &swipeStartTime);
-            return NULL; // suppress
+            log_debug("swipe began — suppressing\n");
+            return NULL;
         }
         if (phase == kGestureChanged && swipeTracking) {
             if (!swipeFired) {
                 double p = CGEventGetDoubleValueField(ev, kCGEventGestureSwipeProgress);
-                if (p != 0.0) { swipeFired = true; perform_switch(p > 0); }
+                if (p != 0.0) {
+                    log_debug("swipe changed — firing (progress=%.3f)\n", p);
+                    swipeFired = true;
+                    perform_switch(p > 0);
+                }
             }
             return NULL;
         }
         if (phase == kGestureEnded && swipeTracking) {
             if (!swipeFired) {
-                // Discrete fast swipe may skip Changed entirely; fall back to velocity
                 double v = CGEventGetDoubleValueField(ev, kCGEventGestureSwipeVelocityX);
-                if (v != 0.0) { swipeFired = true; perform_switch(v > 0); }
+                if (v != 0.0) {
+                    log_debug("swipe ended — firing via velocity (%.3f)\n", v);
+                    swipeFired = true;
+                    perform_switch(v > 0);
+                } else {
+                    log_debug("swipe ended — no velocity, no switch\n");
+                }
             }
             swipeTracking = swipeFired = false;
             return NULL;
         }
         if (phase == kGestureCancelled) {
+            log_debug("swipe cancelled\n");
             swipeTracking = swipeFired = false;
             return NULL;
         }
@@ -174,15 +215,43 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
 static volatile sig_atomic_t running = 1;
 static void stop(int s) { (void)s; running = 0; }
 
+// SIGUSR1 toggles verbose debug logging at runtime. Async-signal-safe: it only
+// flips flags — the state-change line is logged from the run loop, not here.
+static void toggle_debug(int s) { (void)s; debug_enabled = !debug_enabled; debug_toggled = 1; }
+
 int main(void) {
     // Resolve and cache AeroSpace socket path: /tmp/bobko.aerospace-$USER.sock
     struct passwd *pw = getpwuid(getuid());
     if (!pw) {
-        fprintf(stderr, "aerospace-swipe-intercept: getpwuid failed\n");
+        log_always("getpwuid failed\n");
         return 1;
     }
     snprintf(aerospace_sock, sizeof(aerospace_sock),
              "/tmp/bobko.aerospace-%s.sock", pw->pw_name);
+
+    // Single-instance guard: hold an exclusive flock for the process lifetime.
+    // A second launch (double-click, `open`, accidental double-bootstrap) fails
+    // to acquire the lock and exits cleanly — before the Accessibility prompt, so
+    // a duplicate never triggers a second TCC dialog. The kernel releases the lock
+    // on exit (incl. crash/SIGKILL), so it self-heals across restarts.
+    char lock_dir[512], lock_path[600];
+    snprintf(lock_dir, sizeof(lock_dir),
+             "%s/Library/Application Support/aerospace-swipe-intercept", pw->pw_dir);
+    if (mkdir(lock_dir, 0755) != 0 && errno != EEXIST) {
+        log_always("mkdir(%s): %s\n", lock_dir, strerror(errno));
+        return 1;
+    }
+    snprintf(lock_path, sizeof(lock_path), "%s/instance.lock", lock_dir);
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+    if (lock_fd < 0) {
+        log_always("open(%s): %s\n", lock_path, strerror(errno));
+        return 1;
+    }
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        log_always("another instance is already running — exiting\n");
+        return 0; // intentional no-op; leave lock_fd to the running instance
+    }
+    // lock_fd intentionally left open for the process lifetime to hold the lock.
 
     socket_q = dispatch_queue_create(
         "com.aerospace-swipe-intercept.socket", DISPATCH_QUEUE_SERIAL);
@@ -196,10 +265,9 @@ int main(void) {
             &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         AXIsProcessTrustedWithOptions(opts); // show the dialog once
         CFRelease(opts);
-        fprintf(stderr, "aerospace-swipe-intercept: "
-                "waiting for Accessibility permission...\n");
+        log_always("waiting for Accessibility permission...\n");
         while (!AXIsProcessTrusted()) sleep(2);
-        fprintf(stderr, "aerospace-swipe-intercept: Accessibility granted\n");
+        log_always("Accessibility granted\n");
     }
 
     tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
@@ -207,7 +275,7 @@ int main(void) {
         (1ULL << kCGSEventGesture) | (1ULL << kCGSEventDockControl),
         cb, NULL);
     if (!tap) {
-        fprintf(stderr, "aerospace-swipe-intercept: Failed to create event tap.\n");
+        log_always("Failed to create event tap.\n");
         return 1;
     }
 
@@ -216,11 +284,19 @@ int main(void) {
     CGEventTapEnable(tap, true);
     signal(SIGINT, stop);
     signal(SIGTERM, stop);
+    signal(SIGUSR1, toggle_debug);
 
-    fprintf(stderr, "aerospace-swipe-intercept: active (socket: %s)\n", aerospace_sock);
+    log_always("active (socket: %s, debug %s — toggle with `killall -USR1 %s`)\n",
+               aerospace_sock, debug_enabled ? "on" : "off", "aerospace-swipe-intercept");
 
     while (running) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, true);
+
+        // Report SIGUSR1 debug toggles from the run loop (handler stays I/O-free)
+        if (debug_toggled) {
+            debug_toggled = 0;
+            log_always("debug logging %s\n", debug_enabled ? "enabled" : "disabled");
+        }
 
         // Watchdog: check tap health every ~1s
         if (!CGEventTapIsEnabled(tap)) {
