@@ -79,13 +79,127 @@ static volatile sig_atomic_t debug_toggled = 0; // set by SIGUSR1 handler, drain
     do { if (debug_enabled) fprintf(stderr, "aerospace-swipe-intercept: " __VA_ARGS__); } while (0)
 
 // --- AeroSpace socket client -------------------------------------------------
+// Generalized request/response over the AeroSpace Unix socket. Unlike the
+// original fire-and-forget send, the daemon now both *queries* AeroSpace
+// (`list-workspaces ...`) and *commands* it (`workspace <name>`), so it must
+// read and parse the reply it previously discarded.
+//
+// Reply envelope (AeroSpace 0.20.x; version-coupled):
+//   {"stdout":"1\n2","exitCode":0,"stderr":"","serverVersionAndHash":"..."}
+// Key order is NOT stable across replies, so values are extracted by key name,
+// never by position. `stdout` is newline-separated workspace names.
 
-static void send_aerospace(bool right) {
-    log_debug("send_aerospace(%s)\n", right ? "next" : "prev");
+enum { ASI_MAX_WORKSPACES = 64, ASI_STDOUT_MAX = 2048, ASI_REPLY_MAX = 4096 };
+
+typedef struct {
+    bool ok;                    // round-tripped: connected, wrote, parsed a reply
+    int  exit_code;             // AeroSpace exitCode (meaningful only when ok)
+    char out[ASI_STDOUT_MAX];   // unescaped stdout payload
+} asi_reply;
+
+// Serialize args into {"args":[...],"stdin":"","windowId":null,"workspace":null}.
+// Args are short tokens the daemon controls (workspace names originate from
+// AeroSpace's own output), but " and \ are escaped defensively. Returns the
+// payload length, or -1 if it would not fit.
+static int asi_build_payload(char *buf, size_t cap, const char *const *args, int nargs) {
+    size_t n = 0;
+    const char *prefix = "{\"args\":[";
+    const char *suffix = "],\"stdin\":\"\",\"windowId\":null,\"workspace\":null}";
+    size_t plen = strlen(prefix);
+    if (plen >= cap) return -1;
+    memcpy(buf, prefix, plen);
+    n = plen;
+    for (int i = 0; i < nargs; i++) {
+        if (i) { if (n + 1 >= cap) return -1; buf[n++] = ','; }
+        if (n + 1 >= cap) return -1; buf[n++] = '"';
+        for (const char *p = args[i]; *p; p++) {
+            if (*p == '"' || *p == '\\') { if (n + 1 >= cap) return -1; buf[n++] = '\\'; }
+            if (n + 1 >= cap) return -1; buf[n++] = *p;
+        }
+        if (n + 1 >= cap) return -1; buf[n++] = '"';
+    }
+    size_t slen = strlen(suffix);
+    if (n + slen >= cap) return -1;
+    memcpy(buf + n, suffix, slen);
+    n += slen;
+    buf[n] = '\0';
+    return (int)n;
+}
+
+// Extract a JSON string value for `key` from the flat reply envelope, unescaping
+// \n \t \r \" \\. Returns false if the key (as a string-valued field) is absent.
+static bool asi_extract_string(const char *json, const char *key, char *dst, size_t cap) {
+    char pat[40];
+    int pn = snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    if (pn < 0 || (size_t)pn >= sizeof(pat)) return false;
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += (size_t)pn;
+    size_t n = 0;
+    while (*p && *p != '"') {
+        char c = *p;
+        if (c == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+                case 'n': c = '\n'; break;
+                case 't': c = '\t'; break;
+                case 'r': c = '\r'; break;
+                default:  c = *p;   break; // \" \\ / and others → literal
+            }
+        }
+        if (n + 1 >= cap) break;
+        dst[n++] = c;
+        p++;
+    }
+    dst[n] = '\0';
+    return true;
+}
+
+// Extract an integer value for `key` from the flat reply envelope.
+static bool asi_extract_int(const char *json, const char *key, int *out) {
+    char pat[40];
+    int pn = snprintf(pat, sizeof(pat), "\"%s\":", key);
+    if (pn < 0 || (size_t)pn >= sizeof(pat)) return false;
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    *out = atoi(p + pn);
+    return true;
+}
+
+// Split a newline-separated buffer in place into a token array, dropping empty
+// lines (e.g. a trailing newline). Returns the number of tokens.
+static int asi_split_lines(char *buf, char *lines[], int max_lines) {
+    int n = 0;
+    char *p = buf;
+    while (*p && n < max_lines) {
+        char *start = p;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') *p++ = '\0';
+        if (*start) lines[n++] = start;
+    }
+    return n;
+}
+
+// Send an AeroSpace command over the Unix socket and read its reply. Fills
+// `reply` and returns true on a successful round-trip; returns false (caller
+// treats as a no-op) on any socket failure, logging via log_always. Must run on
+// socket_q — never the event-tap thread.
+static bool aerospace_request(const char *const *args, int nargs, asi_reply *reply) {
+    reply->ok = false;
+    reply->exit_code = -1;
+    reply->out[0] = '\0';
+
+    char payload[512];
+    int plen = asi_build_payload(payload, sizeof(payload), args, nargs);
+    if (plen < 0) {
+        log_always("request payload too large\n");
+        return false;
+    }
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         log_always("socket(): %s\n", strerror(errno));
-        return;
+        return false;
     }
 
     // Fail fast — a hung AeroSpace must not stall the serial queue indefinitely
@@ -101,30 +215,159 @@ static void send_aerospace(bool right) {
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         log_always("connect(%s): %s\n", aerospace_sock, strerror(errno));
         close(fd);
-        return;
+        return false;
     }
-    log_debug("connected to %s\n", aerospace_sock);
 
-    // AeroSpace 0.20.x socket protocol (version-coupled; stdin key is required)
-    char buf[256];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"args\":[\"workspace\",\"--wrap-around\",\"%s\"],"
-        "\"stdin\":\"\",\"windowId\":null,\"workspace\":null}",
-        right ? "next" : "prev");
-    if (write(fd, buf, (size_t)len) < 0)
+    if (write(fd, payload, (size_t)plen) < 0) {
         log_always("write(): %s\n", strerror(errno));
-    else
-        log_debug("sent: %s\n", buf);
-    // Reply carries serverVersionAndHash; ignored — we don't validate version here
+        close(fd);
+        return false;
+    }
+    log_debug("sent: %s\n", payload);
+
+    // Read the reply. AeroSpace leaves the connection open after replying, so we
+    // stop at the end of the first complete JSON object (brace depth back to 0)
+    // rather than blocking until EOF or the 250ms recv timeout fires.
+    char raw[ASI_REPLY_MAX];
+    size_t total = 0;
+    int  depth = 0;
+    bool in_str = false, esc = false, started = false, complete = false;
+    while (total < sizeof(raw) - 1) {
+        ssize_t r = read(fd, raw + total, sizeof(raw) - 1 - total);
+        if (r <= 0) break; // EOF, timeout (EAGAIN), or error
+        for (ssize_t i = 0; i < r; i++) {
+            char c = raw[total + i];
+            if (esc) { esc = false; continue; }
+            if (in_str) {
+                if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                depth++;
+                started = true;
+            } else if (c == '}') {
+                if (--depth == 0 && started) { complete = true; break; }
+            }
+        }
+        total += (size_t)r;
+        if (complete) break;
+    }
     close(fd);
+    raw[total] = '\0';
+
+    if (!complete) {
+        log_always("incomplete/empty reply (%zu bytes)\n", total);
+        return false;
+    }
+
+    asi_extract_int(raw, "exitCode", &reply->exit_code);
+    asi_extract_string(raw, "stdout", reply->out, sizeof(reply->out));
+    reply->ok = true;
+    return true;
 }
 
-// Called from the tap callback thread. Dispatches the socket write asynchronously
-// so that socket I/O can never block event delivery and trigger DisabledByTimeout.
-// The serial queue serializes concurrent writes without needing an in-flight guard.
+#define ASI_NARGS(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+// Resolve and switch to the next/previous non-empty workspace on the monitor
+// under the cursor. Runs on socket_q (off the event-tap thread).
+//
+// Algorithm: query the monitor's full ordered workspace list and its non-empty
+// subset, then walk the full order from the currently visible workspace in the
+// swipe direction (wrapping) until landing on a non-empty workspace. Walking the
+// full order means an empty current workspace still steps to the nearest used
+// one in the swipe direction, and reduces to "adjacent non-empty" when the
+// current workspace is itself non-empty. On any query failure or an empty set
+// the daemon does nothing — a no-op is less surprising than landing on an empty
+// workspace (and never the old empty-cycling behavior).
+static void resolve_and_switch(bool right) {
+    // Ordered non-empty workspaces on the mouse monitor — the switch cycle.
+    static const char *const q_nonempty[] = {
+        "list-workspaces", "--monitor", "mouse", "--empty", "no" };
+    asi_reply ne;
+    if (!aerospace_request(q_nonempty, ASI_NARGS(q_nonempty), &ne)) {
+        log_always("could not query non-empty workspaces — no switch\n");
+        return;
+    }
+    char *nonempty[ASI_MAX_WORKSPACES];
+    int nne = asi_split_lines(ne.out, nonempty, ASI_MAX_WORKSPACES);
+    if (nne == 0) {
+        log_always("no non-empty workspaces on monitor under cursor — no switch\n");
+        return;
+    }
+    if (nne == 1) {
+        log_debug("only one non-empty workspace (%s) — no switch\n", nonempty[0]);
+        return;
+    }
+
+    // Full ordered workspace set on the same monitor — lets us resolve the
+    // anchor's position so an empty anchor still steps the right direction.
+    static const char *const q_full[] = {
+        "list-workspaces", "--monitor", "mouse" };
+    asi_reply full;
+    char *order[ASI_MAX_WORKSPACES];
+    int nord = 0;
+    if (aerospace_request(q_full, ASI_NARGS(q_full), &full))
+        nord = asi_split_lines(full.out, order, ASI_MAX_WORKSPACES);
+
+    // Anchor = the workspace currently visible on the monitor under the cursor.
+    static const char *const q_visible[] = {
+        "list-workspaces", "--monitor", "mouse", "--visible" };
+    asi_reply vis;
+    char anchor[64] = "";
+    if (aerospace_request(q_visible, ASI_NARGS(q_visible), &vis)) {
+        char *v[1];
+        if (asi_split_lines(vis.out, v, 1) == 1)
+            snprintf(anchor, sizeof(anchor), "%s", v[0]);
+    }
+
+    const char *target = NULL;
+
+    // Preferred: walk the full order from the anchor in the swipe direction,
+    // wrapping, landing on the first non-empty workspace.
+    if (nord > 0 && anchor[0]) {
+        int ai = -1;
+        for (int i = 0; i < nord; i++)
+            if (strcmp(order[i], anchor) == 0) { ai = i; break; }
+        if (ai >= 0) {
+            for (int step = 1; step <= nord && !target; step++) {
+                int j = right ? (ai + step) % nord
+                              : ((ai - step) % nord + nord) % nord;
+                for (int k = 0; k < nne; k++)
+                    if (strcmp(order[j], nonempty[k]) == 0) { target = nonempty[k]; break; }
+            }
+        }
+    }
+
+    // Fallback: anchor unknown or absent from the order list — step within the
+    // non-empty list, or default to the first/last in the swipe direction.
+    if (!target) {
+        int idx = -1;
+        for (int i = 0; i < nne; i++)
+            if (anchor[0] && strcmp(nonempty[i], anchor) == 0) { idx = i; break; }
+        target = (idx >= 0) ? nonempty[right ? (idx + 1) % nne : (idx - 1 + nne) % nne]
+                            : (right ? nonempty[0] : nonempty[nne - 1]);
+    }
+
+    log_debug("resolve_and_switch(%s): anchor=%s target=%s (%d non-empty)\n",
+              right ? "right" : "left", anchor[0] ? anchor : "?", target, nne);
+
+    const char *cmd[] = { "workspace", target };
+    asi_reply sw;
+    if (!aerospace_request(cmd, ASI_NARGS(cmd), &sw) || sw.exit_code != 0)
+        log_always("switch to workspace %s failed (exit=%d)\n",
+                   target, sw.ok ? sw.exit_code : -1);
+    else
+        log_debug("switched to workspace %s\n", target);
+}
+
+// Called from the tap callback thread. Dispatches the query-compute-switch work
+// asynchronously so socket I/O can never block event delivery and trigger
+// DisabledByTimeout. The serial queue serializes concurrent swipes without
+// needing an in-flight guard.
 static void perform_switch(bool right) {
-    log_debug("perform_switch(%s) — dispatching\n", right ? "next" : "prev");
-    dispatch_async(socket_q, ^{ send_aerospace(right); });
+    log_debug("perform_switch(%s) — dispatching\n", right ? "right" : "left");
+    dispatch_async(socket_q, ^{ resolve_and_switch(right); });
 }
 
 // --- Watchdog notification ---------------------------------------------------
