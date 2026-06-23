@@ -26,6 +26,8 @@ Most swipe daemons tap gesture events in listen-only mode and reconstruct swipes
 
 This daemon works differently: it intercepts the internal dock-swipe event macOS generates *after* gesture recognition, suppresses it before the Dock sees it, and sends the AeroSpace command instead. macOS does all gesture recognition; this only redirects the result.
 
+On each committed swipe it asks AeroSpace (over the same socket) which non-empty workspaces live on the monitor under the cursor and which one is visible, computes the neighbor in the swipe direction, and switches to it by name — so swipes skip empty workspaces and follow your cursor's monitor.
+
 ```
 3-finger swipe
       │
@@ -34,22 +36,43 @@ This daemon works differently: it intercepts the internal dock-swipe event macOS
                     │
       [AerospaceSwipeIntercept] <- active CGEventTap
                     │
-        +-----------+------------+
-    return NULL              AeroSpace socket
-  (Dock never fires)       workspace next/prev
+        +-----------+--------------------------+
+    return NULL              query AeroSpace socket:
+  (Dock never fires)         non-empty workspaces on
+                             monitor under cursor +
+                             visible one -> switch to
+                             the neighbor by name
 ```
 
 ## Behavior
 
 | Gesture | Action |
 |---|---|
-| Swipe right | `workspace --wrap-around next` |
-| Swipe left | `workspace --wrap-around prev` |
+| Swipe right | Next **non-empty** workspace on the monitor under the cursor (wraps around) |
+| Swipe left | Previous **non-empty** workspace on the monitor under the cursor (wraps around) |
 | Swipe up/down | Unchanged (Mission Control, App Expose) |
-| AeroSpace not running | Swipe is a no-op (event suppressed, nothing sent) |
+| AeroSpace not running / query fails | Swipe is a no-op (event suppressed, nothing sent) |
+| Only one (or zero) non-empty workspace on that monitor | No-op — there's nowhere to move |
 | Tap disabled by macOS | Watchdog re-enables it; notifies after ~3s of downtime |
 
-AeroSpace is contacted via its Unix socket directly (`/tmp/bobko.aerospace-$USER.sock`), not the CLI, so there's no process-spawn latency on every swipe.
+Targeting is computed live from AeroSpace, per swipe:
+
+- **Non-empty only.** Empty workspaces are skipped, so a swipe always lands on a workspace you're actually using — never an empty `Z`/`Y`/`X`.
+- **Monitor under the cursor.** The swipe acts on whichever monitor your pointer is on, not AeroSpace's focused monitor. Move the cursor to the other display and swipe there.
+- **By name, not `next`/`prev`.** The daemon resolves the destination workspace and switches to it by name, rather than walking AeroSpace's full workspace order. (It no longer relies on `workspace --wrap-around`; wrap-around is handled in the daemon.)
+
+AeroSpace is contacted via its Unix socket directly (`/tmp/bobko.aerospace-$USER.sock`), not the CLI, so there's no process-spawn latency on every swipe. The daemon reads the socket reply to learn the workspace layout; if AeroSpace is unreachable or returns nothing, the swipe is a silent no-op rather than a guess.
+
+### Some apps swallow the gesture (IntelliJ / JetBrains)
+
+In a few apps — notably JetBrains IDEs (IntelliJ, etc.) — a 3-finger swipe does nothing. Those apps consume the trackpad gesture themselves before macOS turns it into the dock-swipe event this daemon intercepts, so **no event reaches the daemon at all**. This is a macOS-level limitation, not something the daemon can override without a fragile, double-firing reconstruction approach.
+
+If swipes are inert with such an app focused, try:
+
+- **System Settings ▸ Trackpad ▸ More Gestures ▸ "Swipe between pages"** — change the finger count (or turn it off) so the OS routes the horizontal swipe to Spaces instead of in-app page navigation.
+- **The app's own trackpad/gesture binding** — some JetBrains versions map horizontal swipe to back/forward navigation; disable it in the app's settings.
+
+To confirm an app is the cause: enable debug logging (`killall -USR1 aerospace-swipe-intercept`), focus the app, swipe, and check the log — if no swipe-phase lines appear, the app swallowed the gesture.
 
 ## Debugging
 
