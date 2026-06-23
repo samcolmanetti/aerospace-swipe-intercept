@@ -51,6 +51,19 @@ This daemon works differently: it intercepts the internal dock-swipe event macOS
 
 AeroSpace is contacted via its Unix socket directly (`/tmp/bobko.aerospace-$USER.sock`), not the CLI, so there's no process-spawn latency on every swipe.
 
+## Debugging
+
+The daemon logs to `~/Library/Logs/aerospace-swipe-intercept.log` (no `sudo` needed; also visible in Console.app). Normal operation logs only lifecycle and error lines.
+
+Verbose per-event tracing is **off by default**. Toggle it at runtime without restarting:
+
+```sh
+killall -USR1 aerospace-swipe-intercept   # toggles debug logging on, then off again
+tail -f ~/Library/Logs/aerospace-swipe-intercept.log
+```
+
+With debug on, each swipe emits its gesture phase, progress, and velocity, plus a `sent:` line when the AeroSpace command is dispatched. To confirm a swipe is firing, enable debug, swipe, and look for the swipe-phase and `sent:` lines. Errors (socket/connect/write failures, tap disablement) are always logged, even with debug off.
+
 ## Uninstall
 
 ```sh
@@ -84,6 +97,8 @@ For stable Accessibility (TCC) permission across rebuilds, create a self-signed 
 3. Run `make install` - it will use that cert automatically
 
 Without the cert, `make install` falls back to ad-hoc signing and macOS will revoke the Accessibility grant on every rebuild (the binary's code identity changes).
+
+The self-signed cert is for local development only. Release builds (and the Homebrew cask) use ad-hoc signing, which is stable per release artifact but changes across versions — hence the re-authorize step after `brew upgrade`.
 
 ## Credits
 

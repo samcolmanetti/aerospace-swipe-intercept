@@ -53,6 +53,10 @@ install: bundle
 	  '  <true/>' \
 	  '  <key>KeepAlive</key>' \
 	  '  <true/>' \
+	  '  <key>StandardErrorPath</key>' \
+	  '  <string>$(HOME)/Library/Logs/aerospace-swipe-intercept.log</string>' \
+	  '  <key>StandardOutPath</key>' \
+	  '  <string>$(HOME)/Library/Logs/aerospace-swipe-intercept.log</string>' \
 	  '</dict>' \
 	  '</plist>' > $(PLIST)
 	launchctl bootstrap gui/$$(id -u) $(PLIST)
